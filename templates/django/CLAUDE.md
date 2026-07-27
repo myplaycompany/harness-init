@@ -43,6 +43,7 @@
 
 ## 상세 규칙
 
+@.claude/rules/knowledge.md
 @.claude/rules/architecture.md
 @.claude/rules/testing.md
 @.claude/rules/domain.md

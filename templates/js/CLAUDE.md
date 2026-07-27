@@ -102,26 +102,55 @@ instance.propName = value;
 | Repository | 실제 쿼리 결과 | mock 없음 (테스트 DB) |
 | DTO/Schema | 직렬화/역직렬화 결과 | mock 없음 |
 
-## 도메인 지식 (DOMAIN.md)
+## 지식 계층 — 구조는 codegraph, 의미는 DOMAIN.md
 
-프로젝트 루트의 `DOMAIN.md`는 **AI 에이전트가 코드를 작성하기 전에 반드시 참조**해야 하는 도메인 지식 문서입니다.
+지식은 두 계층으로 나뉜다. **어느 계층에 물어야 하는지 먼저 판단하고 움직인다.**
+
+| | 구조 (Structure) | 의미 (Semantics) |
+|---|---|---|
+| 질문 | 어디에 있나 / 무엇이 부르나 / 바꾸면 어디가 깨지나 | 무슨 뜻인가 / 왜 이런가 / 언제 전이하나 |
+| 출처 | **codegraph** (실시간 인덱스) | **DOMAIN.md** |
+| 갱신 | 파일 저장 시 자동 | 사람·에이전트가 직접, 게이트가 강제 |
+
+```bash
+codegraph explore "<질문>"     # 관련 심볼 + 소스 + 호출 경로 한 번에
+codegraph impact <심볼>        # 이걸 바꾸면 어디가 영향받나
+codegraph affected <파일>      # 영향받는 테스트 파일
+```
+
+codegraph가 없으면 Grep/Read로 폴백한다. 하네스는 codegraph 없이도 동작한다.
+
+**구조를 DOMAIN.md에 적지 마라.** 필드 목록·관계·계층 트리는 스키마 파일이 진실의
+원천이고, 문서에 박제하면 그 순간부터 낡는다. DOMAIN.md에는 코드를 아무리 읽어도
+알 수 없는 것 — enum 값의 뜻과 전이 조건, 미들웨어·훅의 부수효과, 도메인 용어와
+내부 슬랭, 비즈니스 규칙 — 만 적는다.
 
 ### 에이전트별 의무
 
 | 에이전트 | 의무 |
 |---------|------|
-| **analyst** | 분석 시작 전 `DOMAIN.md` 필수 참조 (엔티티·용어·API 계약 파악) |
-| **coder** | 코드 변경 완료 후 `DOMAIN.md` 변경 이력 갱신. 새 엔티티·필드·enum 추가 시 해당 섹션도 갱신 |
-| **reviewer** | DOMAIN.md 변경 이력이 이번 작업을 반영하는지 검증. 누락 시 coder에게 보완 요청 |
+| **analyst** | 구조 파악은 codegraph 우선. `DOMAIN.md`에서 상태값 의미·부수효과·용어 확인 |
+| **coder** | 의미가 바뀌는 변경(enum·union·`as const`·`@@map`·훅)을 했으면 같은 커밋에서 `DOMAIN.md` 갱신 |
+| **reviewer** | `domain-gate.py --staged` 로 기계 판정. 미갱신은 PASS 불가 (BLOCKER) |
 
-### 업데이트 규칙
+### 자동 가드레일
 
+개발자가 신경 쓰지 않아도 돌아가도록 세 지점에 게이트가 걸려 있다.
+
+| 시점 | 장치 | 동작 |
+|------|------|------|
+| 세션 시작 | `session-knowledge.sh` | codegraph 동기화 + 낡은 DOMAIN.md 경고 주입 |
+| 파일 편집 직후 | `domain-guard.sh` | 의미 변화 감지 시 exit 2 로 갱신 지시 |
+| 커밋 직전 | `domain-gate` (pre-commit) | DOMAIN.md 미갱신이면 커밋 차단 |
+
+감지는 선언 블록의 지문을 변경 전후로 비교하는 방식이라 리팩토링에는 발화하지 않는다.
+
+```bash
+python3 .claude/scripts/domain-gate.py --staged        # 지금 무엇이 걸리는지
+python3 .claude/scripts/domain-freshness.py .          # 문서 신선도 점검
 ```
-코드 변경 → DOMAIN.md 변경 이력 테이블에 한 줄 추가
-새 엔티티 추가 → 도메인 계층 구조 + 핵심 엔티티 섹션 갱신
-새 enum/status 추가 → 상태 코드 섹션 갱신
-새 API 추가 → API 계약 섹션 갱신
-```
+
+우회는 `git commit --no-verify` 로 가능하지만 **표면화 대상**이다. PR 설명에 사유를 남긴다.
 
 ## 참고 문서
 
@@ -150,7 +179,8 @@ instance.propName = value;
 
 | 훅 | 트리거 | 동작 |
 |----|--------|------|
-| `domain-update-reminder.sh` | Edit / Write 후 | 스키마 파일 변경 → DOMAIN.md 갱신 체크리스트 출력<br>서비스/컨트롤러 변경 → 흐름 업데이트 권고 |
+| `session-knowledge.sh` | 세션 시작 | codegraph 인덱스 증분 동기화 + 낡은 DOMAIN.md 경고 주입 |
+| `domain-guard.sh` | Edit / Write 후 | 편집 파일의 의미 변화 감지 → exit 2 로 DOMAIN.md 갱신 지시 |
 | `insight-collector.sh` | Bash / Edit / Write 후 | Claude 응답의 `★ Insight` 블록을 감지해 `.claude/insights.md`에 자동 저장 |
 
 ## _workspace/ — 에이전트 산출물 디렉토리

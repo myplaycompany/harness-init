@@ -6,10 +6,19 @@
 
 | 이벤트 | 훅 | 동작 |
 |--------|-----|------|
+| SessionStart | `session-knowledge.sh` | codegraph 인덱스 증분 동기화 + 낡은 DOMAIN.md 경고 주입 |
 | PreToolUse(Bash) | `pre-bash-guard.sh` | migrate/DROP/WHERE없는DELETE 전 경고 출력 |
-| PostToolUse(Edit/Write) | `domain-update-reminder.sh` | `models.py` 변경 → DOMAIN.md 갱신 체크리스트 |
+| PostToolUse(Edit/Write) | `domain-guard.sh` | 편집 파일의 의미 변화 감지 → exit 2 로 DOMAIN.md 갱신 지시 |
 | PostToolUse(Edit/Write/Bash) | `insight-collector.sh` | `★ Insight` 블록 감지 → `.claude/insights.md` 저장 |
 | Notification | `notification.sh` | 작업 완료 시 OS 알림 (macOS/Linux/터미널 벨) |
+
+`domain-guard.sh` 는 **편집한 파일 하나만** 판정하고, AST 지문을 변경 전후로 비교한다.
+주석·포맷·리팩토링에는 발화하지 않는다. 발화했다면 Choices 값·시그널 배선·`db_table` 중
+하나가 실제로 바뀐 것이니 DOMAIN.md를 갱신해야 한다. 자세한 내용은
+`@.claude/rules/knowledge.md`.
+
+커밋 직전에는 pre-commit `domain-gate` 가 같은 판정을 스테이지 기준으로 한 번 더 돌려
+문서 미갱신 커밋을 막는다.
 
 추가 훅은 `.claude/hooks/*.sh`로 추가하고 `settings.json`의 `hooks` 섹션에 등록하라.
 

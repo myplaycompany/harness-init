@@ -18,7 +18,20 @@
       "Bash(gh workflow:*)",
       "Bash(ls:*)",
       "Bash(which:*)",
-      "Bash(mypy:*)"
+      "Bash(mypy:*)",
+      "Bash(codegraph explore:*)",
+      "Bash(codegraph node:*)",
+      "Bash(codegraph query:*)",
+      "Bash(codegraph callers:*)",
+      "Bash(codegraph callees:*)",
+      "Bash(codegraph impact:*)",
+      "Bash(codegraph affected:*)",
+      "Bash(codegraph files:*)",
+      "Bash(codegraph status:*)",
+      "Bash(codegraph sync:*)",
+      "Bash(python3 .claude/scripts/domain-gate.py:*)",
+      "Bash(python3 .claude/scripts/domain-extract.py:*)",
+      "Bash(python3 .claude/scripts/domain-freshness.py:*)"
     ],
     "deny": [
       "Bash(git push --force*)",
@@ -33,6 +46,17 @@
     "PYTHONDONTWRITEBYTECODE": "1"
   },
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/session-knowledge.sh",
+            "timeout": 45
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash",
@@ -50,7 +74,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/domain-update-reminder.sh"
+            "command": ".claude/hooks/domain-guard.sh"
           },
           {
             "type": "command",
@@ -63,7 +87,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/domain-update-reminder.sh"
+            "command": ".claude/hooks/domain-guard.sh"
           },
           {
             "type": "command",

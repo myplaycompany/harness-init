@@ -23,3 +23,15 @@ repos:
         language: node
         types_or: [javascript, jsx, ts, tsx]
         args: [--fix, --max-warnings=0]
+
+      # 도메인 의미 변화 게이트.
+      # TS enum · `as const` 상수 객체 · 문자열 리터럴 union 타입이 바뀌었는데
+      # DOMAIN.md가 함께 갱신되지 않으면 커밋을 막는다.
+      # JS/TS는 stdlib AST가 없어 휴리스틱으로 좁게 판정한다 (Python은 AST 정밀 판정).
+      # 우회: git commit --no-verify (사유를 PR 설명에 남길 것)
+      - id: domain-gate
+        name: DOMAIN.md 의미 변화 게이트
+        entry: python3 .claude/scripts/domain-gate.py --staged
+        language: system
+        pass_filenames: false
+        always_run: true

@@ -1,287 +1,210 @@
 #!/bin/bash
 # scripts/domain-init.sh
-# 기존 Django 프로젝트의 각 앱 디렉토리에 DOMAIN.md 스켈레톤을 생성하고
-# 루트 DOMAIN.md에 앱별 참조 인덱스를 구성한다.
+# 앱별 DOMAIN.md 스켈레톤과 루트 DOMAIN.md 인덱스를 생성한다.
+#
+# 이전 버전은 모델 클래스명을 grep으로 긁어 계층 트리와 필드 표를 만들었다.
+# 그 내용은 전부 코드에서 재도출 가능한 "구조"라, 문서에 박제하는 순간 낡기 시작했다.
+# (plab 실측: web/match/models.py 866커밋 대비 DOMAIN.md 19커밋 = 2.2%만 추종)
+#
+# 이제 구조는 codegraph가 실시간으로 답하고, 이 스크립트는 codegraph가 **못 보는 것**만
+# 스켈레톤화한다. 실측으로 확인된 사각지대 세 가지:
+#   - Choices/Enum 값 (codegraph 심볼 아님)
+#   - Meta.db_table 매핑  (codegraph FTS 미검색)
+#   - 시그널 부수효과      (codegraph 호출 그래프에 엣지 없음)
+#
+# 값은 AST로 정확히 뽑고, "그게 무슨 뜻인가"만 TODO로 남긴다.
 #
 # 사용법: bash scripts/domain-init.sh [target_dir]
 
 set -e
 
 TARGET_DIR="${1:-$PWD}"
+TARGET_DIR="${TARGET_DIR%/}"
 TODAY=$(date +%Y-%m-%d)
 PROJECT_NAME=$(basename "$TARGET_DIR")
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EXTRACT="$SCRIPT_DIR/domain-extract.py"
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info()    { echo -e "${BLUE}[domain-init]${NC} $1"; }
 success() { echo -e "${GREEN}[domain-init]${NC} ✓ $1"; }
 warn()    { echo -e "${YELLOW}[domain-init]${NC} ⚠ $1"; }
 
-# ── 상대 경로 (macOS/Linux 공용) ───────────────────────
-rel_path() {
-  python3 -c "import os, sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))" "$1" "$TARGET_DIR"
-}
+if ! command -v python3 &>/dev/null; then
+  warn "python3 없음 — DOMAIN.md 생성을 건너뜁니다"
+  exit 0
+fi
+if [ ! -f "$EXTRACT" ]; then
+  warn "domain-extract.py 없음 ($EXTRACT) — 건너뜁니다"
+  exit 0
+fi
 
-# ── Django 앱 디렉토리 탐지 ─────────────────────────────
-find_django_apps() {
-  find "$TARGET_DIR" -name "models.py" \
-    ! -path "*/migrations/*" \
-    ! -path "*/.venv/*" \
-    ! -path "*/venv/*" \
-    ! -path "*/env/*" \
-    ! -path "*/node_modules/*" \
-    ! -path "*/__pycache__/*" \
-    ! -path "*/.git/*" \
-    ! -path "*/.worktrees/*" \
-    -print0 2>/dev/null \
-  | xargs -0 -n1 dirname \
-  | sort -u
-}
+# ── 의미 지식이 있는 디렉토리 탐색 ─────────────────────
+# 추출기가 실제로 무언가(모델·choices·시그널)를 찾은 디렉토리만 대상으로 삼는다.
+# models.py 존재 여부로 판단하던 방식보다 정확하고, 비 Django 프로젝트도 커버한다.
+info "도메인 지식 보유 디렉토리 탐색 중... ($TARGET_DIR)"
 
-# ── models.py 에서 모델 클래스명 추출 ──────────────────
-extract_models() {
-  local models_file="$1/models.py"
-  [ -f "$models_file" ] || return
-  grep -E "^class [A-Z][A-Za-z0-9_]+" "$models_file" \
-    | sed 's/class \([A-Za-z0-9_]*\).*/\1/' \
-    | head -20
-}
+APP_LIST=$(python3 "$EXTRACT" "$TARGET_DIR" --format json --quiet 2>/dev/null \
+  | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except (json.JSONDecodeError, ValueError):
+    sys.exit(0)
+for app, payload in sorted(data.get("apps", {}).items()):
+    # choices 나 signals 가 있어야 문서로 남길 의미가 있다.
+    # 모델만 있는 디렉토리는 db_table 매핑만 필요하므로 함께 포함한다.
+    if payload["choices"] or payload["signals"] or payload["models"]:
+        print(app)
+')
 
-# ── 앱별 DOMAIN.md 스켈레톤 생성 ───────────────────────
-generate_app_domain() {
-  local app_dir="$1"
-  local app_name
-  app_name=$(basename "$app_dir")
-  local domain_file="$app_dir/DOMAIN.md"
+if [ -z "$APP_LIST" ]; then
+  warn "도메인 지식을 찾지 못했습니다 (모델·Choices·시그널 없음). 건너뜁니다"
+  exit 0
+fi
 
-  if [ -f "$domain_file" ]; then
-    warn "${app_name}/DOMAIN.md 이미 존재, 건너뜀"
-    return
+APP_COUNT=$(echo "$APP_LIST" | wc -l | tr -d ' ')
+info "${APP_COUNT}개 디렉토리 발견"
+
+# ── 앱별 DOMAIN.md 스켈레톤 ────────────────────────────
+CREATED=0
+while IFS= read -r app; do
+  [ -n "$app" ] || continue
+  if [ "$app" = "." ]; then
+    continue  # 루트는 아래에서 따로 처리
   fi
 
-  # 모델 클래스명 추출
-  local models_list
-  models_list=$(extract_models "$app_dir")
+  domain_file="$TARGET_DIR/$app/DOMAIN.md"
+  if [ -f "$domain_file" ]; then
+    warn "$app/DOMAIN.md 이미 존재, 건너뜀"
+    continue
+  fi
 
-  # 모델 트리 시작점 (첫 번째 모델)
-  local first_model=""
-  local tree_body=""
-  while IFS= read -r model; do
-    [ -z "$model" ] && continue
-    if [ -z "$first_model" ]; then
-      first_model="$model"
-    else
-      tree_body="${tree_body}├── ${model}
+  if python3 "$EXTRACT" "$TARGET_DIR" --app "$app" --format skeleton --today "$TODAY" --quiet \
+      > "$domain_file" 2>/dev/null; then
+    success "$app/DOMAIN.md 생성"
+    CREATED=$((CREATED + 1))
+  else
+    rm -f "$domain_file"
+    warn "$app/DOMAIN.md 생성 실패"
+  fi
+done <<< "$APP_LIST"
+
+# ── 루트 DOMAIN.md ─────────────────────────────────────
+ROOT_FILE="$TARGET_DIR/DOMAIN.md"
+
+INDEX_ROWS=""
+while IFS= read -r app; do
+  [ -n "$app" ] && [ "$app" != "." ] || continue
+  [ -f "$TARGET_DIR/$app/DOMAIN.md" ] || continue
+  name=$(basename "$app")
+  INDEX_ROWS="${INDEX_ROWS}| ${name} | [\`${app}/DOMAIN.md\`](${app}/DOMAIN.md) | TODO: 한 줄 설명 |
 "
-    fi
-  done <<< "$models_list"
+done <<< "$APP_LIST"
 
-  # 핵심 모델 섹션 생성
-  local model_sections=""
-  while IFS= read -r model; do
-    [ -z "$model" ] && continue
-    model_sections="${model_sections}
-### ${model} (\`${app_name}/models.py:${model}\`)
-
-- 설명: <!-- TODO: 모델 설명 -->
-- 연결: <!-- TODO: FK/O2O 관계 -->
-- 주요 필드:
-  - <!-- TODO: 필드 목록 -->
-- 메서드:
-  - <!-- TODO: 주요 메서드 -->
-"
-  done <<< "$models_list"
-
-  {
-    echo "# ${app_name} 도메인"
-    echo ""
-    echo "> 최종 업데이트: ${TODAY} | 코드 위치: \`${app_name}/models.py\`, \`${app_name}/services.py\`, \`${app_name}/views.py\`"
-    echo ""
-    echo "<!-- TODO: 이 도메인의 한 줄 설명 -->"
-    echo ""
-    echo "## 도메인 계층 구조"
-    echo ""
-    echo '```'
-    if [ -n "$first_model" ]; then
-      echo "${first_model}"
-      [ -n "$tree_body" ] && printf "%s" "$tree_body"
-    else
-      echo "<!-- TODO: 모델 계층 구조 트리 -->"
-    fi
-    echo '```'
-    echo ""
-    echo "## 핵심 모델"
-    if [ -n "$model_sections" ]; then
-      printf "%s" "$model_sections"
-    else
-      echo ""
-      echo "<!-- TODO: 핵심 모델 상세 -->"
-      echo ""
-    fi
-    echo ""
-    echo "## 상태 코드 / Choices"
-    echo ""
-    echo "<!-- TODO: 모델별 choices 정리 -->"
-    echo ""
-    echo "| 상태 | 코드 | 설명 |"
-    echo "|-----|------|------|"
-    echo "| <!-- TODO --> | \`\` | |"
-    echo ""
-    echo "## 주요 흐름"
-    echo ""
-    echo '```'
-    echo "<!-- TODO: 핵심 비즈니스 플로우 다이어그램 -->"
-    echo '```'
-    echo ""
-    echo "## 변경 이력"
-    echo ""
-    echo "| 날짜 | 변경 내용 |"
-    echo "|-----|----------|"
-    echo "| ${TODAY} | DOMAIN.md 스켈레톤 초기 생성 |"
-  } > "$domain_file"
-
-  success "${app_name}/DOMAIN.md 생성"
-}
-
-# ── 루트 DOMAIN.md 생성 또는 인덱스 섹션 추가 ──────────
-generate_root_domain() {
-  local root_file="$TARGET_DIR/DOMAIN.md"
-  local exists=false
-  [ -f "$root_file" ] && exists=true
-
-  # 인덱스 테이블 행 생성
-  local index_rows=""
-  for app_dir in "$@"; do
-    local app_name
-    app_name=$(basename "$app_dir")
-    local rel
-    rel=$(rel_path "$app_dir")
-    index_rows="${index_rows}| ${app_name} | [\`${rel}/DOMAIN.md\`](${rel}/DOMAIN.md) | <!-- TODO: 한 줄 설명 --> |
-"
-  done
-
-  if $exists; then
-    warn "루트 DOMAIN.md 이미 존재 — 앱 인덱스 섹션을 파일 끝에 추가합니다"
+if [ -f "$ROOT_FILE" ]; then
+  # 인덱스 섹션이 이미 있으면 다시 붙이지 않는다. 무조건 append 하면 재실행할
+  # 때마다 같은 표가 쌓인다.
+  if grep -q "도메인 문서 인덱스" "$ROOT_FILE"; then
+    warn "루트 DOMAIN.md에 인덱스 섹션 이미 존재, 건너뜀"
+  else
+    warn "루트 DOMAIN.md 이미 존재 — 인덱스 섹션만 추가합니다"
     {
       echo ""
       echo "---"
       echo ""
-      echo "## 앱별 DOMAIN.md (domain-init.sh 자동 생성)"
+      echo "## 도메인 문서 인덱스 (domain-init.sh 생성)"
       echo ""
-      echo "> 새 앱이 추가되면 이 테이블에 행을 추가하세요."
-      echo ""
-      echo "| 도메인 | 파일 위치 | 설명 |"
-      echo "|-------|----------|------|"
-      printf "%s" "$index_rows"
-    } >> "$root_file"
-    success "루트 DOMAIN.md 업데이트 (인덱스 추가)"
-    return
+      echo "| 도메인 | 문서 | 설명 |"
+      echo "|-------|------|------|"
+      printf "%s" "$INDEX_ROWS"
+    } >> "$ROOT_FILE"
+    success "루트 DOMAIN.md 인덱스 추가"
   fi
+else
+  cat > "$ROOT_FILE" <<EOF
+# ${PROJECT_NAME} — 도메인 지식
 
-  {
-    echo "# DOMAIN.md - ${PROJECT_NAME} 도메인 지식 사전"
-    echo ""
-    echo "> 최종 업데이트: ${TODAY} | AI LLM이 이 프로젝트의 도메인 지식을 빠르게 파악하기 위한 문서"
-    echo ""
-    echo "## 업데이트 정책"
-    echo ""
-    echo "이 파일과 각 앱의 DOMAIN.md는 **코드 변경과 함께** 항상 최신 상태를 유지해야 합니다."
-    echo ""
-    echo "### 업데이트 트리거"
-    echo "- 새 모델 추가 또는 필드 변경 시 → 해당 앱 DOMAIN.md 업데이트"
-    echo "- 새로운 비즈니스 로직 또는 status / choices 추가 시"
-    echo "- 도메인 용어 정의 추가/수정 시"
-    echo "- 앱 신규 생성 시 → 이 파일 인덱스 테이블에 행 추가"
-    echo ""
-    echo "### 에이전트별 책임"
-    echo "- **analyst**: 티켓 분석 시 관련 앱 DOMAIN.md를 \`필수\` 선행 참조"
-    echo "- **coder**: 코드 변경 후 해당 앱 DOMAIN.md 변경 이력 업데이트"
-    echo "- **reviewer**: 코드 리뷰 시 DOMAIN.md 누락/오래된 내용 경고"
-    echo ""
-    echo "---"
-    echo ""
-    echo "## 도메인 문서 구조"
-    echo ""
-    echo "도메인 지식은 **앱별로 분리**되어 관리됩니다. 상세 내용은 각 앱의 DOMAIN.md를 참조하세요."
-    echo ""
-    echo "| 도메인 | 파일 위치 | 설명 |"
-    echo "|-------|----------|------|"
-    printf "%s" "$index_rows"
-    echo ""
-    echo "---"
-    echo ""
-    echo "## Quick Reference (빠른 검색용)"
-    echo ""
-    echo "<!-- TODO: 프로젝트 주요 용어를 아래 테이블에 정리하세요 -->"
-    echo ""
-    echo "| 용어 | 영문/코드 | 도메인 | 바로가기 |"
-    echo "|-----|----------|-------|---------|"
-    echo "| <!-- TODO --> | | | |"
-    echo ""
-    echo "---"
-    echo ""
-    echo "## 슬랭 / 내부 용어"
-    echo ""
-    echo "<!-- TODO: 팀 내부에서 쓰는 비공식 용어, 줄임말, 별칭 등을 정리하세요 -->"
-    echo ""
-    echo "| 슬랭 | 정식명칭 | 의미 | 관련 코드 |"
-    echo "|-----|---------|-----|----------|"
-    echo "| <!-- TODO --> | | | \`\` |"
-    echo ""
-    echo "---"
-    echo ""
-    echo "## 핵심 관계 다이어그램"
-    echo ""
-    echo "<!-- TODO: 도메인 간 주요 FK/O2O 관계를 다이어그램으로 표현하세요 -->"
-    echo ""
-    echo '```'
-    echo "<!-- 예:"
-    echo "User"
-    echo "├── 1:1 → Profile"
-    echo "├── 1:N → Order"
-    echo "└── 1:N → ..."
-    echo "-->"
-    echo '```'
-    echo ""
-    echo "---"
-    echo ""
-    echo "## 변경 이력"
-    echo ""
-    echo "| 날짜 | 변경 내용 |"
-    echo "|-----|----------|"
-    echo "| ${TODAY} | DOMAIN.md 초기 생성 (domain-init.sh) |"
-  } > "$root_file"
+> **이 문서는 의미(semantics) 전용이다.**
+>
+> 코드 구조 — 심볼이 어디 있는지, 무엇이 무엇을 호출하는지, 무엇을 바꾸면 어디가
+> 깨지는지 — 는 여기 적지 않는다. 문서에 박제하면 그 순간부터 낡는다.
+> 구조는 codegraph에 물어본다:
+>
+> \`\`\`
+> codegraph explore "<질문>"     # 관련 심볼 + 소스 + 호출 경로
+> codegraph impact <심볼>        # 이걸 바꾸면 어디가 영향받나
+> codegraph callers <심볼>       # 누가 호출하나
+> \`\`\`
+>
+> 여기에는 **코드를 아무리 읽어도 알 수 없는 것**만 적는다.
 
+## 프로젝트 개요
+
+| 항목 | 내용 |
+|------|------|
+| 목적 | TODO: 이 시스템이 해결하는 문제 |
+| 주요 사용자 | TODO |
+| 핵심 도메인 | TODO |
+
+## 용어 사전
+
+> 한국어 도메인 용어 ↔ 코드 식별자 대응. 에이전트가 "정산"이라는 말을 듣고
+> \`settlements\`를 찾아갈 수 있게 하는 표다.
+
+| 용어 | 코드 식별자 | 도메인 | 의미 |
+|-----|------------|-------|------|
+| TODO | \`\` | | |
+
+## 슬랭 / 내부 용어
+
+> 팀 안에서만 통하는 줄임말, 별칭, 관용 표현. 신규 입사자와 에이전트가 가장 많이
+> 막히는 지점이고, 코드 어디에도 정의가 없는 유일한 지식이다.
+
+| 슬랭 | 정식 명칭 | 의미 | 관련 코드 |
+|-----|----------|------|----------|
+| TODO | | | \`\` |
+
+## 도메인 간 비즈니스 규칙
+
+> 여러 앱에 걸쳐 있어 한 파일만 봐서는 안 보이는 규칙.
+
+- TODO
+
+## 외부 연동 시스템
+
+| 시스템 | 용도 | 실패 시 영향 | 비고 |
+|--------|------|-------------|------|
+| TODO | | | |
+
+---
+
+## 도메인 문서 인덱스
+
+| 도메인 | 문서 | 설명 |
+|-------|------|------|
+$(printf "%s" "$INDEX_ROWS")
+
+---
+
+## 변경 이력
+
+| 날짜 | 변경 내용 |
+|-----|----------|
+| ${TODAY} | DOMAIN.md 초기 생성 (domain-init.sh) |
+EOF
   success "루트 DOMAIN.md 생성"
-}
-
-# ── 메인 ───────────────────────────────────────────────
-info "Django 앱 탐색 중... ($TARGET_DIR)"
-
-APP_DIRS=()
-while IFS= read -r app_dir; do
-  [ -n "$app_dir" ] && APP_DIRS+=("$app_dir")
-done < <(find_django_apps)
-
-if [ ${#APP_DIRS[@]} -eq 0 ]; then
-  warn "Django 앱을 찾지 못했습니다 (models.py 없음). 건너뜀"
-  exit 0
 fi
 
-info "${#APP_DIRS[@]}개 앱 발견"
-
-for app_dir in "${APP_DIRS[@]}"; do
-  generate_app_domain "$app_dir"
-done
-
-generate_root_domain "${APP_DIRS[@]}"
-
 echo ""
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN} DOMAIN.md 스켈레톤 생성 완료${NC}"
+echo -e "${GREEN} DOMAIN.md 스켈레톤 생성 완료 (신규 ${CREATED}건)${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-echo "  다음 작업 (TODO 항목 채우기):"
-echo "  ├── 각 앱 DOMAIN.md — 모델 설명, FK 관계, choices"
-echo "  ├── 루트 DOMAIN.md  — Quick Reference 테이블"
-echo "  └── 루트 DOMAIN.md  — 슬랭/내부 용어 목록"
+echo "  값·위치는 AST로 채워져 있습니다. 남은 TODO는 '의미'입니다:"
+echo "  ├── 상태값이 각각 무슨 뜻이고 언제 전이하는가"
+echo "  ├── 시그널 핸들러가 무슨 부수효과를 내는가  ← codegraph 사각지대"
+echo "  ├── 용어 사전 · 내부 슬랭"
+echo "  └── 변경 시 주의사항 (과거 사고 지점)"
 echo ""
+echo "  이후 코드에서 값이 바뀌면 pre-commit 게이트가 갱신을 강제합니다."
