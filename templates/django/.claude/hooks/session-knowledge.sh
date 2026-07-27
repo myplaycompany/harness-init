@@ -14,23 +14,39 @@ SCRIPTS="$PROJECT_DIR/.claude/scripts"
 
 export PATH="$HOME/.local/bin:$PATH"
 
+# 두 작업은 서로 의존하지 않는다. 직렬로 두면 최악의 경우 타임아웃이 합산되어
+# 세션 시작이 40초까지 늘어난다. 병렬로 돌려 천장을 절반으로 낮춘다.
+TMPDIR_HOOK=$(mktemp -d 2>/dev/null) || TMPDIR_HOOK=""
+CG_OUT="${TMPDIR_HOOK:-/tmp}/cg.$$"
+FRESH_OUT="${TMPDIR_HOOK:-/tmp}/fresh.$$"
+cleanup() { [ -n "$TMPDIR_HOOK" ] && rm -rf "$TMPDIR_HOOK"; }
+trap cleanup EXIT
+
 # ── 1. 구조 지식 동기화 ────────────────────────────────
-CG_LINE=""
-if command -v codegraph &>/dev/null && [ -d "$PROJECT_DIR/.codegraph" ]; then
-  if (cd "$PROJECT_DIR" && timeout 20 codegraph sync . >/dev/null 2>&1); then
-    CG_LINE="구조 지식(codegraph) 인덱스 동기화됨. 코드 구조·호출 경로·영향 범위는 파일을 훑지 말고 codegraph로 조회하세요."
-  else
-    CG_LINE="구조 지식(codegraph) 동기화 실패 — 인덱스가 낡았을 수 있습니다. 'codegraph index .' 로 재빌드하세요."
+(
+  if command -v codegraph &>/dev/null && [ -d "$PROJECT_DIR/.codegraph" ]; then
+    if (cd "$PROJECT_DIR" && timeout 20 codegraph sync . >/dev/null 2>&1); then
+      echo "구조 지식(codegraph) 인덱스 동기화됨. 코드 구조·호출 경로·영향 범위는 파일을 훑지 말고 codegraph로 조회하세요."
+    else
+      echo "구조 지식(codegraph) 동기화 실패 — 인덱스가 낡았을 수 있습니다. 'codegraph index .' 로 재빌드하세요."
+    fi
+  elif command -v codegraph &>/dev/null; then
+    echo "codegraph 설치됨, 이 프로젝트는 미초기화 — 'codegraph init .' 실행 시 구조 조회를 쓸 수 있습니다."
   fi
-elif command -v codegraph &>/dev/null; then
-  CG_LINE="codegraph 설치됨, 이 프로젝트는 미초기화 — 'codegraph init .' 실행 시 구조 조회를 쓸 수 있습니다."
-fi
+) > "$CG_OUT" 2>/dev/null &
+CG_PID=$!
 
 # ── 2. 의미 지식 신선도 ────────────────────────────────
-FRESH=""
-if [ -f "$SCRIPTS/domain-freshness.py" ] && command -v python3 &>/dev/null; then
-  FRESH=$(timeout 20 python3 "$SCRIPTS/domain-freshness.py" "$PROJECT_DIR" --stale-days 30 2>/dev/null)
-fi
+(
+  if [ -f "$SCRIPTS/domain-freshness.py" ] && command -v python3 &>/dev/null; then
+    timeout 20 python3 "$SCRIPTS/domain-freshness.py" "$PROJECT_DIR" --stale-days 30
+  fi
+) > "$FRESH_OUT" 2>/dev/null &
+FRESH_PID=$!
+
+wait "$CG_PID" "$FRESH_PID" 2>/dev/null
+CG_LINE=$(cat "$CG_OUT" 2>/dev/null)
+FRESH=$(cat "$FRESH_OUT" 2>/dev/null)
 
 # ── 출력 ───────────────────────────────────────────────
 if [ -z "$CG_LINE" ] && [ -z "$FRESH" ]; then

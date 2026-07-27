@@ -24,6 +24,8 @@ domain-extract의 AST 추출 결과를 변경 전/후로 비교해서 판정하�
 """
 
 import argparse
+import importlib.util
+import json
 import os
 import re
 import subprocess
@@ -34,22 +36,24 @@ import sys
 # 애초에 만들지 않는다.
 sys.dont_write_bytecode = True
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
+# 파일명이 domain-extract.py (하이픈) 이라 일반 import 문으로는 불러올 수 없다.
+# 두 스크립트는 대상 프로젝트의 .claude/scripts/ 로 같이 복사되므로 경로는 항상 옆이다.
+_EXTRACT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "domain-extract.py"
+)
+# 로딩 실패는 종료 코드 2(내부 오류)로 알린다. 호출부는 2를 통과 처리하므로
+# 게이트가 고장나도 커밋이 막히지 않는다. traceback으로 죽으면 종료 코드 1이 되어
+# pre-commit이 "위반 있음"으로 오해하고 모든 커밋을 막는다.
+_spec = importlib.util.spec_from_file_location("domain_extract", _EXTRACT_PATH)
+if _spec is None or _spec.loader is None:
+    print(f"domain-gate: {_EXTRACT_PATH} 를 불러올 수 없습니다", file=sys.stderr)
+    sys.exit(2)
+domain_extract = importlib.util.module_from_spec(_spec)
 try:
-    from domain_extract import parse_file  # noqa: F401  (파일명이 하이픈이면 아래 폴백)
-except ImportError:
-    import importlib.util
-
-    _spec = importlib.util.spec_from_file_location(
-        "domain_extract",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "domain-extract.py"),
-    )
-    if _spec is None or _spec.loader is None:
-        print("domain-gate: domain-extract.py를 찾을 수 없습니다", file=sys.stderr)
-        sys.exit(2)
-    domain_extract = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(domain_extract)
+except (OSError, SyntaxError) as _exc:
+    print(f"domain-gate: {_EXTRACT_PATH} 로딩 실패 ({_exc})", file=sys.stderr)
+    sys.exit(2)
 
 # JS/TS/Prisma는 stdlib 파서가 없어 선언 블록을 중괄호 매칭으로 잘라 판정한다.
 # (_js_fingerprint 참조 — Python의 ast 경로와 같은 "전/후 지문 비교" 구조)
@@ -78,24 +82,7 @@ def _fingerprint(source, path):
 
     파싱 불가(구문 오류 등)면 None을 반환해 호출부가 판정을 보류하게 한다.
     """
-    import ast
-    import tempfile
-
-    try:
-        ast.parse(source)
-    except (SyntaxError, ValueError):
-        return None
-
-    with tempfile.NamedTemporaryFile(
-        "w", suffix=".py", delete=False, encoding="utf-8"
-    ) as tmp:
-        tmp.write(source)
-        tmp_path = tmp.name
-    try:
-        result, err = domain_extract.parse_file(tmp_path, path)
-    finally:
-        os.unlink(tmp_path)
-
+    result, err = domain_extract.parse_source(source, path)
     if err or result is None:
         return None
 
@@ -112,38 +99,53 @@ def _fingerprint(source, path):
     return marks
 
 
+def _describe_choice(mark):
+    owner = f"{mark[1]}." if mark[1] else ""
+    # 튜플형 choices(`STATUS_CHOICES = (("a", "A"), ...)`)는 멤버 이름이 없다.
+    # 그 경우 `.None` 이 붙어 읽는 사람을 헷갈리게 하므로 값만 보여준다.
+    member = f".{mark[3]}" if mark[3] else ""
+    return f"상태값 {owner}{mark[2]}{member} = {mark[4]}"
+
+
+def _describe_named(label, mark):
+    return f"{label} {mark[1]}.{mark[2]}" + (f" = {mark[3]}" if mark[3] else "")
+
+
+# 지문 종류별 렌더러. Python과 JS 계열이 같은 어휘를 공유하므로 표를 하나만 둔다.
+_RENDER = {
+    "table": lambda m: f"모델 {m[1]} → 테이블 {m[2]}",
+    "choice": _describe_choice,
+    "signal": lambda m: f"시그널 {m[1]} {m[2]} → {m[3]}()",
+    "enum": lambda m: _describe_named("enum", m),
+    "const": lambda m: _describe_named("상수", m),
+    "union": lambda m: f"union 타입 {m[1]} 의 '{m[2]}'",
+}
+
+
 def _describe(mark):
-    kind = mark[0]
-    if kind == "table":
-        return f"모델 {mark[1]} → 테이블 {mark[2]}"
-    if kind == "choice":
-        owner = f"{mark[1]}." if mark[1] else ""
-        # 튜플형 choices(`STATUS_CHOICES = (("a", "A"), ...)`)는 멤버 이름이 없다.
-        # 그 경우 `.None` 이 붙어 읽는 사람을 헷갈리게 하므로 값만 보여준다.
-        member = f".{mark[3]}" if mark[3] else ""
-        return f"상태값 {owner}{mark[2]}{member} = {mark[4]}"
-    if kind == "signal":
-        return f"시그널 {mark[1]} {mark[2]} → {mark[3]}()"
-    return str(mark)
+    render = _RENDER.get(mark[0])
+    return render(mark) if render else str(mark)
 
 
-def detect_python(repo, path, old_source, new_source):
-    """파이썬 파일의 의미 변화를 전/후 지문 차집합으로 판정한다."""
-    old_marks = _fingerprint(old_source, path) if old_source is not None else set()
-    new_marks = _fingerprint(new_source, path)
+def _diff_marks(old_marks, new_marks):
+    """전/후 지문 차집합을 (동사, 설명) 목록으로 만든다.
 
-    # 새 버전이 파싱 불가면 아직 편집 중이다. 판정을 보류한다.
+    새 지문이 None이면 소스가 파싱 불가한 상태다. 편집 중일 뿐이니 판정을 보류한다.
+    """
     if new_marks is None:
         return []
     if old_marks is None:
         old_marks = set()
 
-    changes = []
-    for mark in sorted(new_marks - old_marks, key=str):
-        changes.append(("추가", _describe(mark)))
-    for mark in sorted(old_marks - new_marks, key=str):
-        changes.append(("삭제", _describe(mark)))
+    changes = [("추가", _describe(m)) for m in sorted(new_marks - old_marks, key=str)]
+    changes += [("삭제", _describe(m)) for m in sorted(old_marks - new_marks, key=str)]
     return changes
+
+
+def detect_python(path, old_source, new_source):
+    """파이썬 파일의 의미 변화를 전/후 지문 차집합으로 판정한다."""
+    old = _fingerprint(old_source, path) if old_source is not None else set()
+    return _diff_marks(old, _fingerprint(new_source, path))
 
 
 def _match_block(source, open_index):
@@ -259,32 +261,12 @@ def _js_fingerprint(source):
     return marks
 
 
-def _describe_js(mark):
-    kind = mark[0]
-    if kind == "enum":
-        return f"enum {mark[1]}.{mark[2]}" + (f" = {mark[3]}" if mark[3] else "")
-    if kind == "const":
-        return f"상수 {mark[1]}.{mark[2]}" + (f" = {mark[3]}" if mark[3] else "")
-    if kind == "union":
-        return f"union 타입 {mark[1]} 의 '{mark[2]}'"
-    if kind == "table":
-        return f"모델 {mark[1]} → 테이블 {mark[2]}"
-    return str(mark)
-
-
-def detect_js(repo, path, old_source, new_source):
+def detect_js(path, old_source, new_source):
     """JS/TS/Prisma 의미 변화를 전/후 지문 차집합으로 판정한다."""
     if new_source is None:
         return []
-    new_marks = _js_fingerprint(new_source)
-    old_marks = _js_fingerprint(old_source) if old_source is not None else set()
-
-    changes = []
-    for mark in sorted(new_marks - old_marks, key=str):
-        changes.append(("추가", _describe_js(mark)))
-    for mark in sorted(old_marks - new_marks, key=str):
-        changes.append(("삭제", _describe_js(mark)))
-    return changes
+    old = _js_fingerprint(old_source) if old_source is not None else set()
+    return _diff_marks(old, _js_fingerprint(new_source))
 
 
 def changed_files(repo, staged, base=None):
@@ -354,39 +336,44 @@ def _read_pair(repo, path, staged, base):
     return old, new
 
 
-def analyze(repo, staged, only_file=None, base=None):
-    """의미 변화가 있는 파일과 그 내용을 모은다."""
-    if only_file:
-        targets = [only_file]
-    else:
-        targets = changed_files(repo, staged, base)
+def _file_from_hook_payload(raw):
+    """PostToolUse 훅 JSON에서 편집 대상 경로를 꺼낸다. 못 찾으면 빈 문자열."""
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return ""
+    tool_input = data.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        return ""
+    return tool_input.get("file_path") or tool_input.get("path") or ""
 
+
+def _detector_for(path):
+    """이 경로를 판정할 함수. 대상이 아니면 None."""
+    if path.endswith(".py"):
+        if "/migrations/" in path or path.startswith("migrations/"):
+            return None
+        if domain_extract.is_test_file(os.path.basename(path)):
+            return None
+        return detect_python
+    if path.endswith(JS_EXTENSIONS):
+        if "__tests__" in path or ".test." in path or ".spec." in path:
+            return None
+        return detect_js
+    return None
+
+
+def analyze(repo, staged, targets, base=None):
+    """의미 변화가 있는 파일과 그 내용을 모은다."""
     findings = {}
     for path in targets:
-        if path.endswith(".py"):
-            if "/migrations/" in path or path.startswith("migrations/"):
-                continue
-            name = os.path.basename(path)
-            if (
-                name.startswith("test_")
-                or name.endswith("_test.py")
-                or name == "conftest.py"
-            ):
-                continue
-            old, new = _read_pair(repo, path, staged, base)
-            if new is None:
-                continue
-            changes = detect_python(repo, path, old, new)
-        elif path.endswith(JS_EXTENSIONS):
-            if "__tests__" in path or ".test." in path or ".spec." in path:
-                continue
-            old, new = _read_pair(repo, path, staged, base)
-            if new is None:
-                continue
-            changes = detect_js(repo, path, old, new)
-        else:
+        detect = _detector_for(path)
+        if detect is None:
             continue
-
+        old, new = _read_pair(repo, path, staged, base)
+        if new is None:
+            continue
+        changes = detect(path, old, new)
         if changes:
             findings[path] = changes
     return findings
@@ -395,17 +382,28 @@ def analyze(repo, staged, only_file=None, base=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--file", help="이 파일 하나만 판정 (레포 루트 기준 상대경로)")
+    parser.add_argument(
+        "--hook-payload",
+        action="store_true",
+        help="stdin의 PostToolUse 훅 JSON에서 대상 파일을 읽는다 (--file 대체)",
+    )
     parser.add_argument("--staged", action="store_true", help="스테이지된 변경을 판정")
     parser.add_argument("--base", help="이 ref 와 HEAD 를 비교 (CI에서 PR 전체 판정)")
     parser.add_argument("--repo", default=".", help="레포 루트")
     args = parser.parse_args()
 
+    only = args.file
+    if args.hook_payload:
+        # 훅이 별도 python3 프로세스로 JSON을 파싱해 넘기면 편집마다 인터프리터가
+        # 두 번 뜬다. Edit/Write 직후마다 도는 경로라 여기서 직접 읽는다.
+        only = _file_from_hook_payload(sys.stdin.read())
+        if not only:
+            return 0
+
     repo = git(["rev-parse", "--show-toplevel"], args.repo, allow_fail=True)
     if not repo:
         return 2
     repo = repo.strip()
-
-    only = args.file
     if only and os.path.isabs(only):
         try:
             only = os.path.relpath(only, repo)
@@ -414,14 +412,21 @@ def main():
     if only and (only.startswith("..") or not os.path.exists(os.path.join(repo, only))):
         return 0
 
-    findings = analyze(repo, args.staged, only, args.base)
+    # 이 모드에서 "건드린 파일" 집합. 판정 대상 선정과 DOMAIN.md 동반 여부 판단에
+    # 같은 목록을 쓰므로 git을 한 번만 부른다.
+    touched = set(changed_files(repo, args.staged, args.base))
+    if not args.staged and not args.base:
+        # 워킹트리 모드에서는 이미 스테이지된 것도 "건드린 것"이다. 개발자가
+        # DOMAIN.md를 먼저 stage 해두고 코드를 마저 고치는 순서를 막지 않는다.
+        touched |= set(changed_files(repo, True))
+
+    findings = analyze(
+        repo, args.staged, [only] if only else sorted(touched), args.base
+    )
     if not findings:
         return 0
 
     # 대응 DOMAIN.md가 이미 함께 변경됐으면 통과시킨다.
-    touched = set(changed_files(repo, args.staged, args.base))
-    if not args.staged and not args.base:
-        touched |= set(changed_files(repo, False))
     unresolved = {}
     for path, changes in findings.items():
         candidates = domain_files_for(repo, path)

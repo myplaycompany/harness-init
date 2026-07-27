@@ -193,12 +193,32 @@ def _extract_connect(node):
     }
 
 
+def is_test_file(name):
+    """도메인 지식 추출 대상에서 제외할 테스트 파일인지."""
+    return (
+        name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py"
+    )
+
+
 def parse_file(path, rel_path):
-    """한 파일에서 models / choices / signals 를 추출한다."""
+    """파일 경로에서 models / choices / signals 를 추출한다."""
     try:
         with open(path, encoding="utf-8") as f:
-            tree = ast.parse(f.read(), filename=path)
-    except (SyntaxError, UnicodeDecodeError, OSError) as exc:
+            source = f.read()
+    except (UnicodeDecodeError, OSError) as exc:
+        return None, f"{rel_path}: {type(exc).__name__}"
+    return parse_source(source, rel_path)
+
+
+def parse_source(source, rel_path):
+    """소스 문자열에서 models / choices / signals 를 추출한다.
+
+    게이트(domain-gate.py)는 git에서 꺼낸 문자열을 그대로 넘긴다. 경로만 받는
+    형태였을 때는 임시 파일에 쓴 뒤 다시 열어 파싱해야 했고, 파싱이 두 번 일어났다.
+    """
+    try:
+        tree = ast.parse(source, filename=rel_path)
+    except (SyntaxError, ValueError) as exc:
         return None, f"{rel_path}: {type(exc).__name__}"
 
     models, choices, signals = [], [], []
@@ -268,16 +288,9 @@ def iter_python_files(root):
             d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")
         ]
         for name in filenames:
-            if not name.endswith(".py"):
+            if not name.endswith(".py") or is_test_file(name):
                 continue
-            if (
-                name.startswith("test_")
-                or name.endswith("_test.py")
-                or name == "conftest.py"
-            ):
-                continue
-            full = os.path.join(dirpath, name)
-            yield full, os.path.relpath(full, root)
+            yield os.path.join(dirpath, name)
 
 
 def collect(root, app=None):
@@ -285,7 +298,7 @@ def collect(root, app=None):
     scan_root = os.path.join(root, app) if app else root
     apps, errors = {}, []
 
-    for full, _ in iter_python_files(scan_root):
+    for full in iter_python_files(scan_root):
         rel_to_root = os.path.relpath(full, root)
         result, err = parse_file(full, rel_to_root)
         if err:

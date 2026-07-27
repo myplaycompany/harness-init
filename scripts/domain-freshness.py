@@ -46,36 +46,28 @@ def git(args, cwd):
     return out.stdout.strip()
 
 
-def last_commit_ts(repo, paths):
-    """주어진 경로들을 건드린 마지막 커밋의 unix timestamp.
+def history(repo, paths):
+    """주어진 경로들의 (마지막 커밋 timestamp, 커밋 수)를 git 한 번으로 얻는다.
 
-    경로를 한꺼번에 pathspec으로 넘겨 git 호출을 1회로 묶는다. 파일마다 호출하면
-    앱 하나에 수십 회가 되어 SessionStart 훅 예산(수 초)을 넘긴다.
+    `git log --format=%ct` 한 번이면 첫 줄이 최신 시각이고 줄 수가 커밋 수다.
+    `log -1` 과 `rev-list --count` 를 따로 부르면 호출이 배로 늘고, 이 함수는
+    SessionStart 훅에서 문서마다 호출되므로 그 차이가 그대로 세션 지연이 된다.
+
+    경로는 한꺼번에 pathspec으로 넘긴다. 파일마다 부르면 앱 하나에 수십 회가 된다.
+    커밋 수는 합계가 아니라 합집합(하나라도 건드린 커밋)이다.
     """
     if isinstance(paths, str):
         paths = [paths]
     if not paths:
-        return None
-    out = git(["log", "-1", "--format=%ct", "--"] + list(paths), repo)
+        return None, 0
+    out = git(["log", "--format=%ct", "--"] + list(paths), repo)
     if not out:
-        return None
+        return None, 0
+    lines = out.splitlines()
     try:
-        return int(out.splitlines()[0])
+        return int(lines[0]), len(lines)
     except (ValueError, IndexError):
-        return None
-
-
-def commit_count(repo, paths):
-    """주어진 경로 중 하나라도 건드린 커밋 수 (합계가 아니라 합집합)."""
-    if isinstance(paths, str):
-        paths = [paths]
-    if not paths:
-        return 0
-    out = git(["rev-list", "--count", "HEAD", "--"] + list(paths), repo)
-    try:
-        return int(out) if out else 0
-    except ValueError:
-        return 0
+        return None, len(lines)
 
 
 def find_domain_files(repo):
@@ -118,14 +110,12 @@ def analyze(repo, stale_days):
         if not sources:
             continue
 
-        doc_ts = last_commit_ts(repo, domain_path)
-        src_ts = last_commit_ts(repo, sources)
+        doc_ts, doc_commits = history(repo, domain_path)
+        src_ts, src_commits = history(repo, sources)
         if not doc_ts or not src_ts:
             continue
 
         lag_days = max(0, (src_ts - doc_ts) // 86400)
-        doc_commits = commit_count(repo, domain_path)
-        src_commits = commit_count(repo, sources)
 
         report.append(
             {
