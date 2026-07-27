@@ -18,3 +18,17 @@ repos:
       - id: ruff
         args: [--fix]
       - id: ruff-format
+
+  # 도메인 의미 변화 게이트.
+  # Choices/Enum 값, 시그널 배선, db_table 이 바뀌었는데 DOMAIN.md가 함께
+  # 갱신되지 않으면 커밋을 막는다. 이 세 가지는 codegraph가 인덱싱하지 못해
+  # 문서에 남기지 않으면 지식이 그대로 유실된다.
+  # 우회: git commit --no-verify (사유를 PR 설명에 남길 것)
+  - repo: local
+    hooks:
+      - id: domain-gate
+        name: DOMAIN.md 의미 변화 게이트
+        entry: python3 .claude/scripts/domain-gate.py --staged
+        language: system
+        pass_filenames: false
+        always_run: true

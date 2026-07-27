@@ -1,0 +1,117 @@
+name: DOMAIN.md Drift Check
+
+# 이전에는 머지 후(post-merge) 앱마다 claude -p 를 호출해 DOMAIN.md를 다시 생성했다.
+# 문제가 셋 있었다:
+#   1. 앱 수만큼 LLM 호출 — 대형 레포에서 머지 한 번에 수십 회
+#   2. 매번 LLM이 문서를 다시 써서 내용이 흔들리고 diff 노이즈가 생김
+#   3. 이미 머지된 뒤라 리뷰어가 검토할 기회가 없음
+#
+# 이제는 머지 **전에** 게이트를 돌린다. LLM을 쓰지 않으므로 비용이 0이고,
+# 로컬 pre-commit 을 우회했거나 설치하지 않은 기여자를 잡아낸다.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  domain-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run domain gate against PR base
+        id: gate
+        run: |
+          if [ ! -f ".claude/scripts/domain-gate.py" ]; then
+            echo "domain-gate.py 없음 — 하네스 미설치 레포로 보고 건너뜁니다"
+            echo "status=skipped" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          BASE="origin/${{ github.event.pull_request.base.ref }}"
+          git fetch --no-tags --depth=0 origin "${{ github.event.pull_request.base.ref }}" || true
+
+          set +e
+          OUTPUT=$(python3 .claude/scripts/domain-gate.py --base "$BASE" 2>&1)
+          CODE=$?
+          set -e
+
+          echo "$OUTPUT"
+
+          if [ "$CODE" -eq 1 ]; then
+            echo "status=drift" >> $GITHUB_OUTPUT
+            {
+              echo 'report<<GATE_EOF'
+              echo "$OUTPUT"
+              echo 'GATE_EOF'
+            } >> $GITHUB_OUTPUT
+          elif [ "$CODE" -eq 0 ]; then
+            echo "status=clean" >> $GITHUB_OUTPUT
+          else
+            echo "게이트 내부 오류 (exit $CODE) — 통과 처리"
+            echo "status=error" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Comment on PR
+        if: steps.gate.outputs.status == 'drift'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const report = `${{ steps.gate.outputs.report }}`;
+            const marker = '<!-- domain-drift-check -->';
+            const body = [
+              marker,
+              '## 도메인 의미 지식 미반영',
+              '',
+              '코드에서 뽑을 수 없는 지식이 바뀌었는데 `DOMAIN.md`가 함께 갱신되지 않았습니다.',
+              'codegraph는 이 영역(Choices 값 · 시그널 배선 · 테이블 매핑)을 인덱싱하지 못하므로,',
+              '문서에 남기지 않으면 그대로 유실됩니다.',
+              '',
+              '```',
+              report,
+              '```',
+              '',
+              '값 목록이 아니라 **의미**를 적어주세요 — 그 값이 무슨 뜻인지, 언제 전이하는지,',
+              '시그널이라면 무슨 부수효과를 내는지.',
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Fail if drift detected
+        if: steps.gate.outputs.status == 'drift'
+        run: |
+          echo "::error::DOMAIN.md 미갱신 — PR 코멘트를 확인하세요"
+          exit 1

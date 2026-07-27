@@ -48,15 +48,15 @@ TeamCreate(
   team_name: "django-backend-team",
   members: [
     { name: "analyst", agent_type: "analyst", model: "opus",
-      prompt: "_workspace/00_input.md를 읽고 영향 범위·모델 선행 분석을 _workspace/01_ticket_analysis.md에 작성. 관련 앱 DOMAIN.md 필수 선행 참조. 완료 시 architect에게 SendMessage." },
+      prompt: "_workspace/00_input.md를 읽고 영향 범위·모델 선행 분석을 _workspace/01_ticket_analysis.md에 작성. 영향 범위는 codegraph로 조회한다(explore/impact/affected). 모델을 건드리는 작업이면 해당 앱 DOMAIN.md의 '시그널 부수효과' 표를 반드시 확인해 분석에 포함 — 시그널 배선은 codegraph 호출 그래프에 나타나지 않는다. 완료 시 architect에게 SendMessage." },
     { name: "architect", agent_type: "architect", model: "opus",
       prompt: "_workspace/01_ticket_analysis.md를 기반으로 Views/Services/Repositories 설계·테스트 전략을 _workspace/02_architecture.md에 작성. 완료 시 coder에게 SendMessage." },
     { name: "coder", agent_type: "coder", model: "opus",
-      prompt: "_workspace/02_architecture.md를 따라 코드 작성. 모델 변경 필요 시 즉시 중단 후 리더에게 보고. 구현 완료 후 해당 앱 DOMAIN.md 변경 이력 갱신. 결과를 _workspace/03_implementation_notes.md에 작성. 완료 시 tester에게 SendMessage." },
+      prompt: "_workspace/02_architecture.md를 따라 코드 작성. 모델 변경 필요 시 즉시 중단 후 리더에게 보고. Choices 값·시그널 배선·db_table 을 바꿨으면 해당 앱 DOMAIN.md에 그 '의미'(뜻·전이조건·부수효과)를 적고 변경 이력 갱신 — 값 목록이나 구조는 적지 않는다. 결과를 _workspace/03_implementation_notes.md에 작성. 완료 시 tester에게 SendMessage." },
     { name: "tester", agent_type: "tester", model: "opus",
       prompt: "_workspace/02_architecture.md 테스트 전략과 _workspace/03_implementation_notes.md 변경 파일 목록을 기반으로 pytest 작성(Factory + PropertyMock). 결과를 _workspace/04_test_notes.md에 작성. 완료 시 reviewer에게 SendMessage." },
     { name: "reviewer", agent_type: "reviewer", model: "opus",
-      prompt: "구현+테스트 완료 변경을 CLAUDE.md 규칙·레이어 경계·DOMAIN.md 체크리스트 E 기준으로 리뷰. _workspace/05_review_report.md 작성. FAIL 시 담당 에이전트에게 SendMessage로 재작업 요청." }
+      prompt: "구현+테스트 완료 변경을 CLAUDE.md 규칙·레이어 경계 기준으로 리뷰. 체크리스트 E는 'python3 .claude/scripts/domain-gate.py --staged' 를 실제로 실행해 판정하고, 종료 코드 1이면 BLOCKER로 FAIL 처리한다(눈으로 훑어 판단 금지). _workspace/05_review_report.md 작성. FAIL 시 담당 에이전트에게 SendMessage로 재작업 요청." }
   ]
 )
 ```
@@ -67,7 +67,7 @@ TeamCreate(
 TaskCreate(tasks: [
   { title: "티켓 분석 및 영향 범위 식별", assignee: "analyst" },
   { title: "레이어드 설계 문서 작성", assignee: "architect" },
-  { title: "Views/Services/Repositories 구현 + 해당 앱 DOMAIN.md 업데이트", assignee: "coder" },
+  { title: "Views/Services/Repositories 구현 + 의미 변화 시 DOMAIN.md 갱신", assignee: "coder" },
   { title: "pytest 테스트 작성 및 실행", assignee: "tester" },
   { title: "레이어 규칙 및 CLAUDE.md 준수 리뷰", assignee: "reviewer" }
 ])
@@ -79,8 +79,8 @@ TaskCreate(tasks: [
 1. analyst → SendMessage(to: architect)
 2. architect → SendMessage(to: coder)
 3. coder ↔ tester (양방향 생성-검증 루프, 최대 3회)
-   - **루프 완료 직후**: coder가 변경된 앱의 `DOMAIN.md` 변경 이력 업데이트 여부 자체 확인
-4. reviewer → DOMAIN.md 체크리스트 E 포함하여 검증 → PASS 시 리더에게 "PR 제출 가능" 보고
+   - **루프 완료 직후**: coder가 `python3 .claude/scripts/domain-gate.py --staged` 를 돌려 종료 코드 0 확인
+4. reviewer → 체크리스트 E를 게이트 실행으로 검증 → PASS 시 리더에게 "PR 제출 가능" 보고
 
 **리뷰 게이트**:
 - FAIL 시: 담당 에이전트에게 SendMessage로 재작업 요청. 최대 2회 루프

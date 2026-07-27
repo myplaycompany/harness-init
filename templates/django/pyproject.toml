@@ -1,5 +1,9 @@
 [tool.ruff]
 line-length = 88
+
+[tool.ruff.lint]
+# ruff 0.2 부터 린터 설정은 [tool.ruff.lint] 하위로 옮겨졌다.
+# 최상위 select/ignore 는 deprecated 라 커밋마다 경고가 뜬다.
 select = ["E", "F", "I"]
 
 [tool.ruff.lint.isort]

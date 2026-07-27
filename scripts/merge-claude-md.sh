@@ -23,6 +23,12 @@ if [ -f "$TARGET_FILE" ]; then
   } >> "$TARGET_FILE"
   echo -e "\033[0;32m[harness]\033[0m ✓ CLAUDE.md 업데이트 완료"
 else
-  cp "$TEMPLATE_FILE" "$TARGET_FILE"
+  # 신규 생성 시에도 마커를 넣는다. 없으면 재실행 시 "harness 설정 없음"으로
+  # 판정해 템플릿 전체를 한 번 더 덧붙인다 (재실행마다 CLAUDE.md가 배로 늘어남).
+  {
+    echo "$MARKER"
+    echo ""
+    cat "$TEMPLATE_FILE"
+  } > "$TARGET_FILE"
   echo -e "\033[0;32m[harness]\033[0m ✓ CLAUDE.md 생성 완료"
 fi
